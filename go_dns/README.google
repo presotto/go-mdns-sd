@@ -1,0 +1,10 @@
+URL: https://code.google.com/p/go/source/browse/src/pkg/net?r=01acf1dbe91f
+Version: 01acf1dbe91f	
+License: BSD-like
+License File: LICENSE
+
+Description:
+	Go dns code
+
+Local Modifications:
+	Extracted from package net into its own package.
