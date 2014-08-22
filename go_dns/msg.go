@@ -607,7 +607,7 @@ func unpackStruct(any dnsStruct, msg []byte, off int) (off1 int, ok bool) {
 				}
 				n := int(msg[off])
 				off++
-				s = string(msg[off:off+n])
+				s = string(msg[off : off+n])
 				off += n
 			}
 			*fv = s

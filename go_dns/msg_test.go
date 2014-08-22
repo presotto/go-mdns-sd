@@ -13,7 +13,7 @@ import (
 func TestDNSTxt(t *testing.T) {
 	// Encode and decode a TXT rr.
 	texts := []string{"the rain in spain", "falls mainly on the plane"}
-	rr := &RR_TXT{RR_Header{"x.local.", TypeTXT, ClassINET|0x8000, 10000, 0}, texts}
+	rr := &RR_TXT{RR_Header{"x.local.", TypeTXT, ClassINET | 0x8000, 10000, 0}, texts}
 	buf := make([]byte, 512)
 	off, ok := packRR(rr, buf, 0)
 	if !ok {
