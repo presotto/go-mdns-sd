@@ -6,7 +6,7 @@ package mdns
 // A cache of DNS RRs (resource records).
 
 import (
-	"code.google.com/p/mdns/go_dns"
+	"github.com/presotto/go-mdns-sd/go_dns"
 	"log"
 	"reflect"
 	"time"

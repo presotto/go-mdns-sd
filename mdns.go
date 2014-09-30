@@ -27,9 +27,9 @@ package mdns
 // Each multicastIfc has a cache of information learned from its network.
 
 import (
-	"code.google.com/p/mdns/go_dns"
 	"errors"
 	"fmt"
+	"github.com/presotto/go-mdns-sd/go_dns"
 	"log"
 	"net"
 	"reflect"
@@ -455,7 +455,12 @@ func (s *MDNS) udpListener(ifc *multicastIfc) {
 // A go routine to wake up the main loop periodicly.  We need this to 'refresh' what we have advertised to the network.
 func (s *MDNS) alarmClock() {
 	for s.run() {
-		time.Sleep(110 * time.Second)
+		// Try to get in two broadcasts before others start timing us out.
+		secs := (s.ttl - 1) / 2
+		if secs == 0 {
+			secs = 1
+		}
+		time.Sleep(time.Duration(secs) * time.Second)
 		s.refreshAlarm <- struct{}{}
 		s.cleanupAlarm <- struct{}{}
 	}

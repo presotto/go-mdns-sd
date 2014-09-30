@@ -6,7 +6,7 @@ package mdns
 // Helper routines for creating/manipulating dns messages.
 
 import (
-	"code.google.com/p/mdns/go_dns"
+	"github.com/presotto/go-mdns-sd/go_dns"
 	"net"
 )
 
