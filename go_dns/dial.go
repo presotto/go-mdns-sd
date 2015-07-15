@@ -6,6 +6,7 @@
 package dns
 
 import (
+	"errors"
 	netpkg "net"
 	"strings"
 )
@@ -78,7 +79,7 @@ func dialAddr(net, addr string, addri netpkg.Addr) (c netpkg.Conn, err error) {
 	case *netpkg.IPAddr:
 		c, err = netpkg.DialIP(net, nil, ra)
 	default:
-		err = &netpkg.OpError{"dial", net + " " + addr, nil, netpkg.UnknownNetworkError(net)}
+		err = errors.New("Unknown network address type")
 	}
 	if err != nil {
 		return nil, err
