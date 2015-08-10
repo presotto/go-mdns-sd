@@ -224,6 +224,7 @@ type MDNS struct {
 
 	// The host name.
 	hostName string
+	hostFQDN string
 
 	// Services we are announcing and their ports
 	services map[string]announceRequest
@@ -250,6 +251,48 @@ func losecolons(x string) string {
 	return y
 }
 
+func ipsAreAllMine(ips []net.IP) bool {
+	if len(ips) == 0 {
+		return true
+	}
+	addrs, _ := net.InterfaceAddrs()
+	for _, ip := range ips {
+		found := false
+		for _, addr := range addrs {
+			switch x := addr.(type) {
+			case *net.IPNet:
+				if x.IP.Equal(ip) {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *MDNS) isDoppelGanger(rr []dns.RR) bool {
+	var ips []net.IP
+	for _, rr := range rr {
+		if rr.Header().Name != s.hostFQDN {
+			continue
+		}
+		switch x := rr.(type) {
+		case *dns.RR_A:
+			ips = append(ips, AtoIP(x))
+		case *dns.RR_AAAA:
+			ips = append(ips, AAAAtoIP(x))
+		}
+	}
+	if len(ips) == 0 {
+		return false
+	}
+	return !ipsAreAllMine(ips)
+}
+
 // Create a new MDNS service.
 func NewMDNS(host, v4addr, v6addr string, loopback, debug bool) (s *MDNS, err error) {
 	s = new(MDNS)
@@ -267,7 +310,6 @@ func NewMDNS(host, v4addr, v6addr string, loopback, debug bool) (s *MDNS, err er
 	}
 	s.debug = debug
 	s.loopback = loopback
-	s.hostName = host
 	s.ttl = 120
 
 	// Allocate channels for communications internal to MDNS
@@ -287,13 +329,25 @@ func NewMDNS(host, v4addr, v6addr string, loopback, debug bool) (s *MDNS, err er
 		log.Fatalf("scanning interfaces: %s", err)
 	}
 
-	// If we weren't passed in a host name, use the highest lexicographic hardware address.
-	if len(s.hostName) == 0 {
-		s.hostName = losecolons(highesthwaddr)
-	}
-
 	go s.mainLoop()
 	go s.alarmClock()
+
+	// If the name ends in a '()', tack on our hwaddr.
+	if len(host) != 0 {
+		if strings.HasSuffix(host, "()") {
+			host = fmt.Sprintf("%s(%s)", strings.TrimSuffix(host, "()"), losecolons(highesthwaddr))
+		}
+
+		// Make sure someone else isn't using our name already.
+		ips, _ := s.ResolveAddress(host)
+		if !ipsAreAllMine(ips) {
+			// Close down our multicasts ifcs.
+			s.Stop()
+			return nil, errors.New("host name in use")
+		}
+		s.hostName = host
+		s.hostFQDN = hostFQDN(host)
+	}
 
 	// Announce ourselves if the host name is set.
 	if len(s.hostName) > 0 {
@@ -597,6 +651,10 @@ func (s *MDNS) mainLoop() {
 				if s.debug {
 					log.Printf("%s: response %v\n", s.hostName, m.msg)
 				}
+				if s.isDoppelGanger(m.msg.Answer) {
+					log.Printf("%s: name collision, %s also claims to be %s\n", s.hostName, m.sender, s.hostFQDN)
+					continue
+				}
 				for _, rr := range m.msg.Answer {
 					if m.mifc.cache.Add(rr) {
 						s.changedRR(rr)
@@ -677,6 +735,9 @@ func (s *MDNS) AddService(service, host string, port uint16, txt ...string) erro
 		return errors.New("service name cannot be null")
 	}
 	if len(host) == 0 {
+		if s.hostName == "" {
+			return errors.New("AddService requires a host name")
+		}
 		host = s.hostName
 	} else {
 		host = hostUnqualify(host)
