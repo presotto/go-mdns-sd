@@ -131,6 +131,18 @@ func TestMdns(t *testing.T) {
 	watchFor(t, c, instances[1])
 	close(c)
 
+	// Remove a service from one of the mdns instances.
+	s1.RemoveService("veyronns", instances[0].host)
+
+	// Wait for a goodbye message to get out and get reflected back.
+	time.Sleep(3 * time.Second)
+
+	// Make sure service discovery doesn't return the removed service.
+	discovered = s1.ServiceDiscovery("veyronns")
+	checkDiscovered(t, instances[0].host, discovered, []instance{instances[1]})
+	discovered = s2.ServiceDiscovery("veyronns")
+	checkDiscovered(t, instances[1].host, discovered, []instance{instances[1]})
+
 	s1.Stop()
 	s2.Stop()
 }

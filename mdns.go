@@ -29,13 +29,14 @@ package mdns
 import (
 	"errors"
 	"fmt"
-	"github.com/presotto/go-mdns-sd/go_dns"
 	"log"
 	"net"
 	"reflect"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/presotto/go-mdns-sd/go_dns"
 )
 
 // All incoming network messages carries enough context for a network appropriate response.
@@ -78,7 +79,7 @@ func newMulticastIfc(ipver int, ifc net.Interface, addr *net.UDPAddr, addresses 
 		ifc:       ifc,
 		addr:      addr,
 		addresses: addresses,
-		cache:     newRRCache(),
+		cache:     newRRCache(mdns.debug),
 		mdns:      mdns,
 		ipver:     ipver,
 	}
@@ -137,7 +138,11 @@ func (m *multicastIfc) appendDiscoveryRecords(msg *dns.Msg, service, host string
 	msg.Answer = append(msg.Answer, NewPtrRR(serviceDN, dns.ClassINET, ttl, uniqueServiceDN))
 	m.appendTxtRR(msg, service, host, txt, ttl)
 	m.appendSrvRR(msg, service, host, port, ttl)
-	m.appendHostAddresses(msg, host, dns.TypeALL, ttl)
+	if ttl > 0 {
+		// Do not append host address in a goodbye packet, since host may be
+		// shared by other services and we do not want to delete it.
+		m.appendHostAddresses(msg, host, dns.TypeALL, ttl)
+	}
 }
 
 // Send a message on a multicast net and cache it locally.
@@ -196,6 +201,11 @@ type announceRequest struct {
 	txt     []string
 }
 
+type goodbyeRequest struct {
+	service string
+	host    string
+}
+
 type watchedService struct {
 	c   *sync.Cond
 	gen int
@@ -218,6 +228,7 @@ type MDNS struct {
 
 	// All access methods turn into channel requests to the main loop to make synchronization trivial.
 	announce     chan announceRequest
+	goodbye      chan goodbyeRequest
 	lookup       chan lookupRequest
 	refreshAlarm chan struct{}
 	cleanupAlarm chan struct{}
@@ -315,6 +326,7 @@ func NewMDNS(host, v4addr, v6addr string, loopback, debug bool) (s *MDNS, err er
 	// Allocate channels for communications internal to MDNS
 	s.fromNet = make(chan *msgFromNet, 10)
 	s.announce = make(chan announceRequest)
+	s.goodbye = make(chan goodbyeRequest)
 	s.lookup = make(chan lookupRequest)
 	s.refreshAlarm = make(chan struct{})
 	s.cleanupAlarm = make(chan struct{})
@@ -679,6 +691,15 @@ func (s *MDNS) mainLoop() {
 			for _, mifc := range s.mifcs {
 				mifc.announceService(req.service, req.host, req.port, req.txt, s.ttl)
 			}
+		case req := <-s.goodbye:
+			// Removing a service
+			delete(s.services, req.service)
+			log.Printf("removing service %s %s\n", req.service, req.host)
+
+			// Tell all the networks about the goodbye
+			for _, mifc := range s.mifcs {
+				mifc.announceService(req.service, req.host, 0, nil, 0)
+			}
 		case req := <-s.lookup:
 			// Reply with all matching requests from all interfaces and then close the channel.
 			for _, mifc := range s.mifcs {
@@ -743,6 +764,23 @@ func (s *MDNS) AddService(service, host string, port uint16, txt ...string) erro
 		host = hostUnqualify(host)
 	}
 	s.announce <- announceRequest{service, host, port, txt}
+	return nil
+}
+
+// Remove a service.  If the host name is empty, we just use the host name from NewMDNS.  If the host name ends in .local. we strip it off.
+func (s *MDNS) RemoveService(service, host string) error {
+	if len(service) == 0 {
+		return errors.New("service name cannot be null")
+	}
+	if len(host) == 0 {
+		if s.hostName == "" {
+			return errors.New("RemoveService requires a host name")
+		}
+		host = s.hostName
+	} else {
+		host = hostUnqualify(host)
+	}
+	s.goodbye <- goodbyeRequest{service, host}
 	return nil
 }
 
@@ -818,7 +856,7 @@ func (s *MDNS) ResolveAddress(dn string) ([]net.IP, uint32) {
 	return ips, minttl
 }
 
-// SubscriberToService declare our interest in a service.  This should elicit responses from everyone implementing that service.  This is
+// SubscriberToService declares our interest in a service.  This should elicit responses from everyone implementing that service.  This is
 // orthogonal to offering the service ourselves.
 func (s *MDNS) SubscribeToService(service string) {
 	serviceDN := serviceFQDN(service)
@@ -831,6 +869,14 @@ func (s *MDNS) SubscribeToService(service string) {
 	for _, mifc := range s.mifcs {
 		mifc.sendQuestion(q)
 	}
+}
+
+// UnsubscribeFromService withholds our interest in a service.
+func (s *MDNS) UnsubscribeFromService(service string) {
+	serviceDN := serviceFQDN(service)
+	s.watchedLock.Lock()
+	delete(s.subscribed, serviceDN)
+	s.watchedLock.Unlock()
 }
 
 type ServiceInstance struct {

@@ -23,6 +23,10 @@ var (
 		&dns.RR_TXT{dns.RR_Header{"x.local.", dns.TypeTXT, dns.ClassINET | 0x8000, 10000, 0}, []string{"except on tuesday"}},
 		&dns.RR_PTR{dns.RR_Header{"x.local.", dns.TypePTR, dns.ClassINET | 0x8000, 10000, 0}, "q.local."},
 	}
+	goodbye []dns.RR = []dns.RR{
+		&dns.RR_TXT{dns.RR_Header{"x.local.", dns.TypeTXT, dns.ClassINET, 0, 0}, []string{"except on tuesday"}},
+		&dns.RR_PTR{dns.RR_Header{"x.local.", dns.TypePTR, dns.ClassINET, 0, 0}, "q.local."},
+	}
 )
 
 // Lookup RRs that match.
@@ -77,7 +81,7 @@ func compare(a, b []dns.RR) bool {
 }
 
 func TestRRCache(t *testing.T) {
-	cache := newRRCache()
+	cache := newRRCache(*debugFlag)
 	// Cache a number of RRs with short TTLs.
 	for _, rr := range short {
 		cache.Add(rr)
@@ -114,5 +118,15 @@ func TestRRCache(t *testing.T) {
 	x = lookup(cache, "x.local.", dns.TypeALL)
 	if !compare(x, override) {
 		t.Errorf("%v != %v", x, override)
+	}
+
+	// Make sure goodbye works.  The entries should be deleted after one second.
+	for _, rr := range goodbye {
+		cache.Add(rr)
+	}
+	time.Sleep(2 * time.Second)
+	x = lookup(cache, "x.local.", dns.TypeALL)
+	if len(x) != 0 {
+		t.Errorf("%v != []", x)
 	}
 }

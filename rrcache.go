@@ -6,10 +6,11 @@ package mdns
 // A cache of DNS RRs (resource records).
 
 import (
-	"github.com/presotto/go-mdns-sd/go_dns"
 	"log"
 	"reflect"
 	"time"
+
+	"github.com/presotto/go-mdns-sd/go_dns"
 )
 
 type rrCacheEntry struct {
@@ -25,9 +26,10 @@ type rrCache struct {
 }
 
 // Create a new rr cache.  Make sure at least the top level map exists.
-func newRRCache() *rrCache {
+func newRRCache(debug bool) *rrCache {
 	rrcache := new(rrCache)
 	rrcache.cache = make(map[string]map[uint16][]*rrCacheEntry, 0)
+	rrcache.debug = debug
 	return rrcache
 }
 
@@ -42,8 +44,8 @@ func (c *rrCache) Add(rr dns.RR) bool {
 	// Create an entry for the domain name if none exists.
 	dnmap, ok := c.cache[rr.Header().Name]
 	if !ok {
-		c.cache[rr.Header().Name] = make(map[uint16][]*rrCacheEntry, 0)
-		dnmap = c.cache[rr.Header().Name]
+		dnmap = make(map[uint16][]*rrCacheEntry, 0)
+		c.cache[rr.Header().Name] = dnmap
 	}
 
 	// Remove all rr's matching this one's type if a cache flush is requested.
@@ -54,9 +56,16 @@ func (c *rrCache) Add(rr dns.RR) bool {
 		dnmap[rr.Header().Rrtype] = make([]*rrCacheEntry, 0)
 	}
 
-	// Don't believe TTLs greater than 75 minutes.  Entries should refresh much faster than this.
-	if rr.Header().Ttl > 4500 {
+	switch {
+	case rr.Header().Ttl > 4500:
+		// Don't believe TTLs greater than 75 minutes. Entries should refresh much faster than this.
 		rr.Header().Ttl = 4500
+	case rr.Header().Ttl == 0:
+		// This is a goodbye packet. RFC 6762 specifies that queriers receiving a multicast DNS
+		// response with a TTL of zero should record a TTL of 1 and then delete the record one
+		// second later. This gives the other cooperating responders one second to rescue the
+		// records when the goodbye packet was sent incorrectly.
+		rr.Header().Ttl = 1
 	}
 
 	// Add absolute expiration time to the entry.
