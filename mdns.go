@@ -29,13 +29,14 @@ package mdns
 import (
 	"errors"
 	"fmt"
-	"github.com/presotto/go-mdns-sd/go_dns"
 	"log"
 	"net"
 	"reflect"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/presotto/go-mdns-sd/go_dns"
 )
 
 // All incoming network messages carries enough context for a network appropriate response.
@@ -78,7 +79,7 @@ func newMulticastIfc(ipver int, ifc net.Interface, addr *net.UDPAddr, addresses 
 		ifc:       ifc,
 		addr:      addr,
 		addresses: addresses,
-		cache:     newRRCache(),
+		cache:     newRRCache(mdns.debug),
 		mdns:      mdns,
 		ipver:     ipver,
 	}
@@ -137,7 +138,11 @@ func (m *multicastIfc) appendDiscoveryRecords(msg *dns.Msg, service, host string
 	msg.Answer = append(msg.Answer, NewPtrRR(serviceDN, dns.ClassINET, ttl, uniqueServiceDN))
 	m.appendTxtRR(msg, service, host, txt, ttl)
 	m.appendSrvRR(msg, service, host, port, ttl)
-	m.appendHostAddresses(msg, host, dns.TypeALL, ttl)
+	if ttl > 0 {
+		// Do not append host address in a goodbye packet, since host may be
+		// shared by other services and we do not want to delete it.
+		m.appendHostAddresses(msg, host, dns.TypeALL, ttl)
+	}
 }
 
 // Send a message on a multicast net and cache it locally.
@@ -196,9 +201,16 @@ type announceRequest struct {
 	txt     []string
 }
 
+type updateRequest struct {
+	done chan struct{}
+	host string
+	ttl  uint32
+}
+
 type watchedService struct {
-	c   *sync.Cond
-	gen int
+	c    *sync.Cond
+	gen  int
+	done bool
 }
 
 type MDNS struct {
@@ -217,21 +229,24 @@ type MDNS struct {
 	fromNet chan *msgFromNet
 
 	// All access methods turn into channel requests to the main loop to make synchronization trivial.
-	announce     chan announceRequest
-	lookup       chan lookupRequest
-	refreshAlarm chan struct{}
-	cleanupAlarm chan struct{}
+	announce chan announceRequest
+	goodbye  chan announceRequest
+	lookup   chan lookupRequest
+	update   chan updateRequest
+
+	refreshAlarm *time.Ticker
+	cleanupAlarm *time.Ticker
 
 	// The host name.
 	hostName string
 	hostFQDN string
 
-	// Services we are announcing and their ports
-	services map[string]announceRequest
+	// Services we are announcing and their hosts and ports.
+	services map[string]map[string]announceRequest
 
 	// Services whose memberships are being watched or subscribed to.
 	watchedLock sync.RWMutex
-	watched     map[string]*watchedService
+	watched     map[string][]*watchedService
 	subscribed  map[string]bool
 
 	// TTL to use for outgoing RRs.
@@ -315,12 +330,12 @@ func NewMDNS(host, v4addr, v6addr string, loopback, debug bool) (s *MDNS, err er
 	// Allocate channels for communications internal to MDNS
 	s.fromNet = make(chan *msgFromNet, 10)
 	s.announce = make(chan announceRequest)
+	s.goodbye = make(chan announceRequest)
 	s.lookup = make(chan lookupRequest)
-	s.refreshAlarm = make(chan struct{})
-	s.cleanupAlarm = make(chan struct{})
+	s.update = make(chan updateRequest)
 
-	s.services = make(map[string]announceRequest, 0)
-	s.watched = make(map[string]*watchedService, 0)
+	s.services = make(map[string]map[string]announceRequest, 0)
+	s.watched = make(map[string][]*watchedService, 0)
 	s.subscribed = make(map[string]bool, 0)
 	s.mifcs = make(map[string]*multicastIfc, 0)
 
@@ -329,8 +344,8 @@ func NewMDNS(host, v4addr, v6addr string, loopback, debug bool) (s *MDNS, err er
 		log.Fatalf("scanning interfaces: %s", err)
 	}
 
+	s.setAlarms()
 	go s.mainLoop()
-	go s.alarmClock()
 
 	// If the name ends in a '()', tack on our hwaddr.
 	if len(host) != 0 {
@@ -345,13 +360,10 @@ func NewMDNS(host, v4addr, v6addr string, loopback, debug bool) (s *MDNS, err er
 			s.Stop()
 			return nil, errors.New("host name in use")
 		}
-		s.hostName = host
-		s.hostFQDN = hostFQDN(host)
-	}
-
-	// Announce ourselves if the host name is set.
-	if len(s.hostName) > 0 {
-		s.refreshAlarm <- struct{}{}
+		// Request the host update and wait until it is updated.
+		req := updateRequest{done: make(chan struct{}), host: host}
+		s.update <- req
+		<-req.done
 	}
 
 	return s, nil
@@ -481,7 +493,7 @@ func (s *MDNS) ScanInterfaces() (string, error) {
 
 // Change the ttl for outgoing records to something other than the default.
 func (s *MDNS) SetOutgoingTTL(ttl uint32) {
-	s.ttl = ttl
+	s.update <- updateRequest{ttl: ttl}
 }
 
 // A go routine to listen for packets on a network.  Pass to the main loop with sufficient information to
@@ -506,17 +518,28 @@ func (s *MDNS) udpListener(ifc *multicastIfc) {
 	}
 }
 
-// A go routine to wake up the main loop periodicly.  We need this to 'refresh' what we have advertised to the network.
-func (s *MDNS) alarmClock() {
-	for s.run() {
-		// Try to get in two broadcasts before others start timing us out.
-		secs := (s.ttl - 1) / 2
-		if secs == 0 {
-			secs = 1
-		}
-		time.Sleep(time.Duration(secs) * time.Second)
-		s.refreshAlarm <- struct{}{}
-		s.cleanupAlarm <- struct{}{}
+// setAlarms sets alarms to wake up the main loop periodically.  We need this
+// to 'refresh' what we have advertised to the network.
+func (s *MDNS) setAlarms() {
+	s.stopAlarms()
+	alarm := (s.ttl - 1) / 2
+	if alarm == 0 {
+		alarm = 1
+	}
+	s.refreshAlarm = time.NewTicker(time.Duration(alarm) * time.Second)
+	// We use a short cleanup cycle to reflect goodbye packets quickly.
+	if alarm > 3 {
+		alarm = 3
+	}
+	s.cleanupAlarm = time.NewTicker(time.Duration(alarm) * time.Second)
+}
+
+func (s *MDNS) stopAlarms() {
+	if s.refreshAlarm != nil {
+		s.refreshAlarm.Stop()
+	}
+	if s.cleanupAlarm != nil {
+		s.cleanupAlarm.Stop()
 	}
 }
 
@@ -550,6 +573,10 @@ func hostUnqualify(host string) string {
 	return strings.TrimSuffix(host, ".")
 }
 
+func hostport(host string, port uint16) string {
+	return fmt.Sprintf("%s:%d", host, port)
+}
+
 func serviceFQDNFromInstanceFQDN(instance string) string {
 	pieces := strings.SplitAfterN(instance, ".", 2)
 	if len(pieces) != 2 {
@@ -563,10 +590,12 @@ func (s *MDNS) answerA(m *msgFromNet, q dns.Question, msg *dns.Msg) {
 		m.mifc.appendHostAddresses(msg, s.hostName, dns.TypeA, s.ttl)
 		return
 	}
-	for _, req := range s.services {
-		if q.Name == hostFQDN(req.host) {
-			m.mifc.appendHostAddresses(msg, req.host, dns.TypeA, s.ttl)
-			return
+	for _, set := range s.services {
+		for _, req := range set {
+			if q.Name == hostFQDN(req.host) {
+				m.mifc.appendHostAddresses(msg, req.host, dns.TypeA, s.ttl)
+				return
+			}
 		}
 	}
 }
@@ -576,38 +605,44 @@ func (s *MDNS) answerAAAA(m *msgFromNet, q dns.Question, msg *dns.Msg) {
 		m.mifc.appendHostAddresses(msg, s.hostName, dns.TypeAAAA, s.ttl)
 		return
 	}
-	for _, req := range s.services {
-		if q.Name == hostFQDN(req.host) {
-			m.mifc.appendHostAddresses(msg, req.host, dns.TypeAAAA, s.ttl)
-			return
+	for _, set := range s.services {
+		for _, req := range set {
+			if q.Name == hostFQDN(req.host) {
+				m.mifc.appendHostAddresses(msg, req.host, dns.TypeAAAA, s.ttl)
+				return
+			}
 		}
 	}
 }
 
 func (s *MDNS) answerPTR(m *msgFromNet, q dns.Question, msg *dns.Msg) {
-	for service, req := range s.services {
+	for service, set := range s.services {
 		if q.Name == serviceFQDN(service) {
-			m.mifc.appendDiscoveryRecords(msg, service, req.host, req.port, req.txt, s.ttl)
+			for _, req := range set {
+				m.mifc.appendDiscoveryRecords(msg, service, req.host, req.port, req.txt, s.ttl)
+			}
 			return
 		}
 	}
 }
 
 func (s *MDNS) answerSRV(m *msgFromNet, q dns.Question, msg *dns.Msg) {
-	for service, req := range s.services {
-		if q.Name == instanceFQDN(req.host, service) {
-			m.mifc.appendSrvRR(msg, service, req.host, req.port, s.ttl)
-			m.mifc.appendHostAddresses(msg, req.host, dns.TypeALL, s.ttl)
-			break
+	for service, set := range s.services {
+		for _, req := range set {
+			if q.Name == instanceFQDN(req.host, service) {
+				m.mifc.appendSrvRR(msg, service, req.host, req.port, s.ttl)
+				m.mifc.appendHostAddresses(msg, req.host, dns.TypeALL, s.ttl)
+			}
 		}
 	}
 }
 
 func (s *MDNS) answerTXT(m *msgFromNet, q dns.Question, msg *dns.Msg) {
-	for service, req := range s.services {
-		if q.Name == instanceFQDN(req.host, service) {
-			m.mifc.appendTxtRR(msg, service, req.host, req.txt, s.ttl)
-			break
+	for service, set := range s.services {
+		for _, req := range set {
+			if q.Name == instanceFQDN(req.host, service) {
+				m.mifc.appendTxtRR(msg, service, req.host, req.txt, s.ttl)
+			}
 		}
 	}
 }
@@ -637,6 +672,24 @@ func (s *MDNS) answerQuestionFromNet(m *msgFromNet) {
 	}
 	if len(msg.Answer) > 0 {
 		m.mifc.sendMessage(msg)
+	}
+}
+
+// refresh reannounces all services.  We need to do this before the TTLs run out.
+// As a side effect this reannounces the host address RRs.
+func (s *MDNS) refresh() {
+	if len(s.services) > 0 {
+		for service, set := range s.services {
+			for _, req := range set {
+				for _, mifc := range s.mifcs {
+					mifc.announceService(service, req.host, req.port, req.txt, s.ttl)
+				}
+			}
+		}
+	} else if len(s.hostName) > 0 {
+		for _, mifc := range s.mifcs {
+			mifc.announceHost(s.hostName, s.ttl)
+		}
 	}
 }
 
@@ -672,12 +725,32 @@ func (s *MDNS) mainLoop() {
 			}
 		case req := <-s.announce:
 			// Adding a service
-			s.services[req.service] = req
-			log.Printf("adding service %s %s %d %v\n", req.service, req.host, req.port, req.txt)
+			set := s.services[req.service]
+			if set == nil {
+				set = make(map[string]announceRequest)
+				s.services[req.service] = set
+			}
+			set[hostport(req.host, req.port)] = req
+			log.Printf("adding service %s %s %d\n", req.service, req.host, req.port)
 
 			// Tell all the networks about the name
 			for _, mifc := range s.mifcs {
 				mifc.announceService(req.service, req.host, req.port, req.txt, s.ttl)
+			}
+		case req := <-s.goodbye:
+			// Removing a service
+			set := s.services[req.service]
+			if set != nil {
+				delete(set, hostport(req.host, req.port))
+			}
+			if len(set) == 0 {
+				delete(s.services, req.service)
+			}
+			log.Printf("removing service %s %s %d\n", req.service, req.host, req.port)
+
+			// Tell all the networks about the goodbye
+			for _, mifc := range s.mifcs {
+				mifc.announceService(req.service, req.host, req.port, req.txt, 0)
 			}
 		case req := <-s.lookup:
 			// Reply with all matching requests from all interfaces and then close the channel.
@@ -685,24 +758,22 @@ func (s *MDNS) mainLoop() {
 				mifc.cache.Lookup(req.name, req.rrtype, req.rc)
 			}
 			close(req.rc)
-		case <-s.refreshAlarm:
-			// Reannounce all services.  We need to do this before the TTLs run out.  As a side
-			// effect this reannounces the host address RRs.
-			if len(s.hostName) == 0 {
-				break
+		case req := <-s.update:
+			if len(req.host) > 0 {
+				s.hostName = req.host
+				s.hostFQDN = hostFQDN(s.hostName)
+				s.refresh()
 			}
-			if len(s.services) == 0 {
-				for _, mifc := range s.mifcs {
-					mifc.announceHost(s.hostName, s.ttl)
-				}
-			} else {
-				for service, req := range s.services {
-					for _, mifc := range s.mifcs {
-						mifc.announceService(service, req.host, req.port, req.txt, s.ttl)
-					}
-				}
+			if req.ttl > 0 && req.ttl != s.ttl {
+				s.ttl = req.ttl
+				s.setAlarms()
 			}
-		case <-s.cleanupAlarm:
+			if req.done != nil {
+				close(req.done)
+			}
+		case <-s.refreshAlarm.C:
+			s.refresh()
+		case <-s.cleanupAlarm.C:
 			for _, mifc := range s.mifcs {
 				rrs := mifc.cache.CleanExpired()
 				for _, rr := range rrs {
@@ -718,6 +789,8 @@ func (s *MDNS) Stop() {
 	s.doneLock.Lock()
 	s.done = true
 	s.doneLock.Unlock()
+	s.update <- updateRequest{}
+	s.stopAlarms()
 	for _, mifc := range s.mifcs {
 		mifc.conn.Close()
 	}
@@ -743,6 +816,23 @@ func (s *MDNS) AddService(service, host string, port uint16, txt ...string) erro
 		host = hostUnqualify(host)
 	}
 	s.announce <- announceRequest{service, host, port, txt}
+	return nil
+}
+
+// Remove a service.  If the host name is empty, we just use the host name from NewMDNS.  If the host name ends in .local. we strip it off.
+func (s *MDNS) RemoveService(service, host string, port uint16, txt ...string) error {
+	if len(service) == 0 {
+		return errors.New("service name cannot be null")
+	}
+	if len(host) == 0 {
+		if s.hostName == "" {
+			return errors.New("RemoveService requires a host name")
+		}
+		host = s.hostName
+	} else {
+		host = hostUnqualify(host)
+	}
+	s.goodbye <- announceRequest{service, host, port, txt}
 	return nil
 }
 
@@ -818,7 +908,7 @@ func (s *MDNS) ResolveAddress(dn string) ([]net.IP, uint32) {
 	return ips, minttl
 }
 
-// SubscriberToService declare our interest in a service.  This should elicit responses from everyone implementing that service.  This is
+// SubscriberToService declares our interest in a service.  This should elicit responses from everyone implementing that service.  This is
 // orthogonal to offering the service ourselves.
 func (s *MDNS) SubscribeToService(service string) {
 	serviceDN := serviceFQDN(service)
@@ -831,6 +921,14 @@ func (s *MDNS) SubscribeToService(service string) {
 	for _, mifc := range s.mifcs {
 		mifc.sendQuestion(q)
 	}
+}
+
+// UnsubscribeFromService withholds our interest in a service.
+func (s *MDNS) UnsubscribeFromService(service string) {
+	serviceDN := serviceFQDN(service)
+	s.watchedLock.Lock()
+	delete(s.subscribed, serviceDN)
+	s.watchedLock.Unlock()
 }
 
 type ServiceInstance struct {
@@ -912,8 +1010,8 @@ func (s *MDNS) ServiceDiscovery(service string) []ServiceInstance {
 					// We may get the same text record from multiple networks so
 					// we need to suppress dups.
 					found := false
-					for i := range txtRRs {
-						if reflect.DeepEqual(rr.Txt, txtRRs[i].Txt) {
+					for _, txtRR := range txtRRs {
+						if reflect.DeepEqual(rr.Txt, txtRR.Txt) {
 							found = true
 							break
 						}
@@ -983,7 +1081,7 @@ func (s *MDNS) changedRR(rr dns.RR) {
 		log.Printf("%s: changed %v\n", s.hostName, rr)
 	}
 	s.watchedLock.RLock()
-	if w, ok := s.watched[dn]; ok {
+	for _, w := range s.watched[dn] {
 		w.c.L.Lock()
 		w.gen++
 		w.c.L.Unlock()
@@ -1032,18 +1130,10 @@ func deepEqual(a, b *ServiceInstance) bool {
 
 // serviceMemberWatcher gets signalled each time membership might have changed.
 func (s *MDNS) serviceMemberWatcher(service string, w *watchedService, reply chan ServiceInstance) {
-	// A client signals its intent to stop by closing the channel.
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("serviceMemberWatcher recover: %s", r)
-		}
-	}()
-
 	var old map[string]ServiceInstance
 
 	// Loop waiting for changes and tell any to client.
-	gen := 0
-	for {
+	for gen, done := 0, false; !done; {
 		// Get current membership.
 		current := make(map[string]ServiceInstance, 0)
 		for _, x := range s.ServiceDiscovery(service) {
@@ -1073,30 +1163,54 @@ func (s *MDNS) serviceMemberWatcher(service string, w *watchedService, reply cha
 
 		// Wait for the next change.
 		w.c.L.Lock()
-		for gen == w.gen {
+		for gen == w.gen && !w.done {
 			w.c.Wait()
 		}
-		gen = w.gen
+		gen, done = w.gen, w.done
 		w.c.L.Unlock()
 	}
+
+	// Remove the watched service.
+	serviceDN := serviceFQDN(service)
+	s.watchedLock.Lock()
+	watched := s.watched[serviceDN]
+	for i, e := range watched {
+		if e == w {
+			n := len(watched) - 1
+			watched[i] = watched[n]
+			watched[n] = nil
+			watched = watched[:n]
+			break
+		}
+	}
+	s.watched[serviceDN] = watched
+	s.watchedLock.Unlock()
+	close(reply)
 }
 
 // ServiceMemberWatch returns a reply channel over which membership changes are announced.
-// A zero TTL means that the instance is no longer a member.
-func (s *MDNS) ServiceMemberWatch(service string) chan ServiceInstance {
+// The returned function stops watching and closes the reply channel. A zero SRV and TXT
+// record means that the instance is no longer a member.
+func (s *MDNS) ServiceMemberWatch(service string) (<-chan ServiceInstance, func()) {
 	serviceDN := serviceFQDN(service)
 
-	// Make sure we have a broadcast condition
+	// Add a new watcher.
 	c := make(chan ServiceInstance, 20)
+	w := &watchedService{c: sync.NewCond(new(sync.Mutex))}
 	s.watchedLock.Lock()
-	if _, ok := s.watched[serviceDN]; !ok {
-		s.watched[serviceDN] = &watchedService{c: sync.NewCond(new(sync.Mutex))}
-	}
+	s.watched[serviceDN] = append(s.watched[serviceDN], w)
 	s.watchedLock.Unlock()
+	stop := func() {
+		w.c.L.Lock()
+		w.done = true
+		w.c.L.Unlock()
+		w.c.Broadcast()
+	}
 
-	// Fire off a go routine to do the actual watching.  This lives forever.
-	go s.serviceMemberWatcher(service, s.watched[serviceDN], c)
-	return c
+	// Fire off a go routine to do the actual watching. This lives until the stop
+	// function is called.
+	go s.serviceMemberWatcher(service, w, c)
+	return c, stop
 }
 
 // Hostname return our chosen host name.

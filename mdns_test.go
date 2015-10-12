@@ -4,7 +4,9 @@
 package mdns
 
 import (
+	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"reflect"
@@ -32,68 +34,90 @@ func createInstance(service string, inst instance) *MDNS {
 	return s
 }
 
-func checkDiscovered(t *testing.T, host string, discovered []ServiceInstance, instances []instance) {
+func checkDiscovered(host string, discovered []ServiceInstance, instances ...instance) error {
 	log.Printf("%s: instances %v %v", host, discovered, instances)
 	if len(instances) != len(discovered) {
-		t.Errorf("%s found %d instances expected %d", host, len(instances), len(discovered))
+		return fmt.Errorf("%s found %d instances, but expected %d", host, len(instances), len(discovered))
 	}
 
 	// Make sure the answers are what we were hoping for.
-	var foundsrv int
-	var foundtxt int
+	foundsrv := make(map[int]bool)
+	foundtxt := make(map[int]bool)
 	for _, x := range discovered {
+		if len(x.SrvRRs) == 0 && len(x.TxtRRs) == 0 {
+			for i, inst := range instances {
+				if x.Name == inst.host && inst.port == 0 && len(inst.txt) == 0 {
+					foundsrv[i] = true
+					foundtxt[i] = true
+				}
+			}
+			continue
+		}
+
 		for _, rr := range x.SrvRRs {
+			found := false
 			for i, inst := range instances {
 				if x.Name == inst.host && rr.Target == hostFQDN(inst.host) && rr.Port == inst.port {
-					foundsrv = foundsrv | (1 << (uint8(i)))
+					found = true
+					foundsrv[i] = true
 				}
+			}
+			if !found {
+				return fmt.Errorf("%s found unexpected SRV %s:%d", host, rr.Target, rr.Port)
 			}
 		}
 		for _, rr := range x.TxtRRs {
+			found := false
 			for i, inst := range instances {
 				if x.Name == inst.host && reflect.DeepEqual(rr.Txt, inst.txt) {
-					foundtxt = foundtxt | (1 << (uint8(i)))
+					found = true
+					foundtxt[i] = true
 				}
+			}
+			if !found {
+				return fmt.Errorf("%s found unexpected TXT %v", host, rr.Txt)
 			}
 		}
 	}
 	for i, inst := range instances {
-		if (foundsrv & (1 << (uint8(i)))) == 0 {
-			t.Errorf("checkInstances %s didn't find SRV %s:%d", hostFQDN(inst.host), inst.port)
+		if !foundsrv[i] {
+			return fmt.Errorf("%s didn't find SRV %s:%d", host, hostFQDN(inst.host), inst.port)
 		}
-		if (foundtxt & (1 << (uint8(i)))) == 0 {
-			t.Errorf("checkInstances didn't find TXT %v", inst.txt)
+		if !foundtxt[i] {
+			return fmt.Errorf("%s didn't find TXT %s:%d", host, inst.txt)
 		}
 	}
+	return nil
 }
 
-func checkIps(t *testing.T, ips []net.IP) {
+func checkIps(ips []net.IP) error {
 	log.Printf("%v", ips)
 	if len(ips) == 0 {
-		t.Errorf("no ips found")
+		return errors.New("no ips found")
 	}
+	return nil
 }
 
-func watchFor(t *testing.T, c chan ServiceInstance, inst instance) {
-	select {
-	case x := <-c:
-		for _, rr := range x.SrvRRs {
-			log.Printf("watcher %s SRV %s %d", rr.Header().Name, rr.Target, rr.Port)
-			if rr.Target == hostFQDN(inst.host) && rr.Port == inst.port {
-				break
-			}
-			t.Errorf("watcher expected %s %d got %s %d", hostFQDN(inst.host), inst.port, rr.Target, rr.Port)
+func watchFor(host string, c <-chan ServiceInstance, wants ...instance) error {
+	discovered := make([]ServiceInstance, 0, len(wants))
+loop:
+	for len(discovered) < len(wants) {
+		select {
+		case inst := <-c:
+			discovered = append(discovered, inst)
+		case <-time.After(5 * time.Second):
+			break loop
 		}
-		for _, rr := range x.TxtRRs {
-			log.Printf("watcher %s TXT %v", rr.Header().Name, rr.Txt)
-			if reflect.DeepEqual(rr.Txt, inst.txt) {
-				break
-			}
-			t.Errorf("watcher expected %v got %v", inst.txt, rr.Txt)
-		}
-	case <-time.NewTimer(2 * time.Second).C:
-		t.Errorf("watcher didn't hear %s %d", inst.host, inst.port)
 	}
+	return checkDiscovered(host+" watcher", discovered, wants...)
+}
+
+func watchForRemoved(host string, c <-chan ServiceInstance, wants ...instance) error {
+	removed := make([]instance, len(wants))
+	for i, want := range wants {
+		removed[i] = instance{host: want.host}
+	}
+	return watchFor(host, c, removed...)
 }
 
 func TestMdns(t *testing.T) {
@@ -104,8 +128,10 @@ func TestMdns(t *testing.T) {
 
 	// Create two mdns instances.
 	s1 := createInstance("veyronns", instances[0])
-	c := s1.ServiceMemberWatch("veyronns")
-	watchFor(t, c, instances[0])
+	w1, _ := s1.ServiceMemberWatch("veyronns")
+	if err := watchFor(instances[0].host, w1, instances[0]); err != nil {
+		t.Error(err)
+	}
 	s2 := createInstance("veyronns", instances[1])
 
 	// Multicast on each interface our desire to know about veyronns instances.
@@ -117,19 +143,64 @@ func TestMdns(t *testing.T) {
 
 	// Make sure service discovery returns both instances.
 	discovered := s1.ServiceDiscovery("veyronns")
-	checkDiscovered(t, instances[0].host, discovered, instances)
+	if err := checkDiscovered(instances[0].host, discovered, instances...); err != nil {
+		t.Error(err)
+	}
 	discovered = s2.ServiceDiscovery("veyronns")
-	checkDiscovered(t, instances[1].host, discovered, instances)
+	if err := checkDiscovered(instances[1].host, discovered, instances...); err != nil {
+		t.Error(err)
+	}
 
 	// Look up addresses for both systems.
 	ips, _ := s1.ResolveAddress(instances[1].host)
-	checkIps(t, ips)
+	if err := checkIps(ips); err != nil {
+		t.Error(err)
+	}
 	ips, _ = s2.ResolveAddress(instances[0].host)
-	checkIps(t, ips)
+	if err := checkIps(ips); err != nil {
+		t.Error(err)
+	}
+	ips, _ = s2.ResolveAddress(instances[0].host)
+	if err := checkIps(ips); err != nil {
+		t.Error(err)
+	}
 
 	// Make sure the watcher learned about both systems.
-	watchFor(t, c, instances[1])
-	close(c)
+	if err := watchFor(instances[0].host, w1, instances[1]); err != nil {
+		t.Error(err)
+	}
+
+	// Make sure multiple watchers for the same service work as well.
+	w2, stopw2 := s1.ServiceMemberWatch("veyronns")
+	if err := watchFor(instances[0].host, w2, instances...); err != nil {
+		t.Error(err)
+	}
+	// Make sure the watcher closed the channel when stopped.
+	stopw2()
+	if _, ok := <-w2; ok {
+		t.Errorf("watcher didn't close the channel")
+	}
+
+	// Remove a service from one of the mdns instances.
+	s1.RemoveService("veyronns", instances[0].host, instances[0].port, instances[0].txt...)
+
+	// Wait for a goodbye message to get out and get reflected back.
+	time.Sleep(3 * time.Second)
+
+	// Make sure watcher learns the removed service.
+	if err := watchForRemoved(instances[0].host, w1, instances[0]); err != nil {
+		t.Error(err)
+	}
+
+	// Make sure service discovery doesn't return the removed service.
+	discovered = s1.ServiceDiscovery("veyronns")
+	if err := checkDiscovered(instances[0].host, discovered, instances[1]); err != nil {
+		t.Error(err)
+	}
+	discovered = s2.ServiceDiscovery("veyronns")
+	if err := checkDiscovered(instances[1].host, discovered, instances[1]); err != nil {
+		t.Error(err)
+	}
 
 	s1.Stop()
 	s2.Stop()
