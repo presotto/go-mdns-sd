@@ -138,9 +138,7 @@ func (m *multicastIfc) appendDiscoveryRecords(msg *dns.Msg, service, host string
 	msg.Answer = append(msg.Answer, NewPtrRR(serviceDN, dns.ClassINET, ttl, uniqueServiceDN))
 	m.appendTxtRR(msg, service, host, txt, ttl)
 	m.appendSrvRR(msg, service, host, port, ttl)
-	if ttl > 0 {
-		// Do not append host address in a goodbye packet, since host may be
-		// shared by other services and we do not want to delete it.
+	if port > 0 {
 		m.appendHostAddresses(msg, host, dns.TypeALL, ttl)
 	}
 }
@@ -592,7 +590,7 @@ func (s *MDNS) answerA(m *msgFromNet, q dns.Question, msg *dns.Msg) {
 	}
 	for _, set := range s.services {
 		for _, req := range set {
-			if q.Name == hostFQDN(req.host) {
+			if q.Name == hostFQDN(req.host) && req.port > 0 {
 				m.mifc.appendHostAddresses(msg, req.host, dns.TypeA, s.ttl)
 				return
 			}
@@ -607,7 +605,7 @@ func (s *MDNS) answerAAAA(m *msgFromNet, q dns.Question, msg *dns.Msg) {
 	}
 	for _, set := range s.services {
 		for _, req := range set {
-			if q.Name == hostFQDN(req.host) {
+			if q.Name == hostFQDN(req.host) && req.port > 0 {
 				m.mifc.appendHostAddresses(msg, req.host, dns.TypeAAAA, s.ttl)
 				return
 			}
@@ -631,7 +629,9 @@ func (s *MDNS) answerSRV(m *msgFromNet, q dns.Question, msg *dns.Msg) {
 		for _, req := range set {
 			if q.Name == instanceFQDN(req.host, service) {
 				m.mifc.appendSrvRR(msg, service, req.host, req.port, s.ttl)
-				m.mifc.appendHostAddresses(msg, req.host, dns.TypeALL, s.ttl)
+				if req.port > 0 {
+					m.mifc.appendHostAddresses(msg, req.host, dns.TypeALL, s.ttl)
+				}
 			}
 		}
 	}
@@ -803,6 +803,7 @@ func (s *MDNS) run() bool {
 }
 
 // Announce a service.  If the host name is empty, we just use the host name from NewMDNS.  If the host name ends in .local. we strip it off.
+// If the port is zero, we do not announce the host addresses.
 func (s *MDNS) AddService(service, host string, port uint16, txt ...string) error {
 	if len(service) == 0 {
 		return errors.New("service name cannot be null")
