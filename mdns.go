@@ -79,7 +79,7 @@ func newMulticastIfc(ipver int, ifc net.Interface, addr *net.UDPAddr, addresses 
 		ifc:       ifc,
 		addr:      addr,
 		addresses: addresses,
-		cache:     newRRCache(mdns.debug),
+		cache:     newRRCache(mdns.logLevel),
 		mdns:      mdns,
 		ipver:     ipver,
 	}
@@ -145,16 +145,20 @@ func (m *multicastIfc) appendDiscoveryRecords(msg *dns.Msg, service, host string
 
 // Send a message on a multicast net and cache it locally.
 func (m *multicastIfc) sendMessage(msg *dns.Msg) {
-	if m.mdns.debug {
+	if m.mdns.logLevel >= 2 {
 		log.Printf("sending message %v\n", msg)
 	}
 	buf, ok := msg.Pack()
 	if !ok {
-		log.Printf("can't pack address message\n")
+		if m.mdns.logLevel >= 1 {
+			log.Printf("can't pack address message\n")
+		}
 		return
 	}
 	if _, err := m.conn.WriteTo(buf, m.addr); err != nil {
-		log.Printf("WriteTo failed %v %v", m.addr, err)
+		if m.mdns.logLevel >= 1 {
+			log.Printf("WriteTo failed %v %v", m.addr, err)
+		}
 	}
 
 	// Cache these RRs in case we ask about ourself.
@@ -250,7 +254,9 @@ type MDNS struct {
 	// TTL to use for outgoing RRs.
 	ttl uint32
 
-	debug    bool
+	// TODO: Use a "real" leveled logging module, e.g.
+	// https://github.com/golang/glog.
+	logLevel int
 	loopback bool
 }
 
@@ -307,7 +313,7 @@ func (s *MDNS) isDoppelGanger(rr []dns.RR) bool {
 }
 
 // Create a new MDNS service.
-func NewMDNS(host, v4addr, v6addr string, loopback, debug bool) (s *MDNS, err error) {
+func NewMDNS(host, v4addr, v6addr string, loopback bool, logLevel int) (s *MDNS, err error) {
 	s = new(MDNS)
 	if v4addr == "" {
 		v4addr = "224.0.0.251:5353"
@@ -321,7 +327,7 @@ func NewMDNS(host, v4addr, v6addr string, loopback, debug bool) (s *MDNS, err er
 	if s.v6addr, err = net.ResolveUDPAddr("udp", v6addr); err != nil {
 		return nil, err
 	}
-	s.debug = debug
+	s.logLevel = logLevel
 	s.loopback = loopback
 	s.ttl = 120
 
@@ -400,7 +406,9 @@ func (s *MDNS) ScanInterfaces() (string, error) {
 	for _, ifc := range ifcs {
 		addresses, addrErr := ifc.Addrs()
 		if addrErr != nil {
-			log.Printf("Addrs() failed: %s", addrErr)
+			if s.logLevel >= 1 {
+				log.Printf("Addrs() failed: %s", addrErr)
+			}
 			continue
 		}
 
@@ -419,7 +427,9 @@ func (s *MDNS) ScanInterfaces() (string, error) {
 			case *net.IPNet:
 				// We either use loopback or non-loopback interfaces (generally loopback is for testing).
 				if (address.IP.IsLoopback() && !s.loopback) || (!address.IP.IsLoopback() && s.loopback) {
-					log.Printf("skipping ifc %d %s %s\n", ifc.Index, ifc.Name, address)
+					if s.logLevel >= 1 {
+						log.Printf("skipping ifc %d %s %s\n", ifc.Index, ifc.Name, address)
+					}
 					continue
 				}
 
@@ -452,7 +462,9 @@ func (s *MDNS) ScanInterfaces() (string, error) {
 			}
 		}
 		m.stop()
-		log.Printf("removing ifc %s", m)
+		if s.logLevel >= 1 {
+			log.Printf("removing ifc %s", m)
+		}
 		delete(s.mifcs, k)
 	}
 
@@ -463,14 +475,20 @@ func (s *MDNS) ScanInterfaces() (string, error) {
 		}
 		conn, err := net.ListenMulticastUDP("udp", &newm.ifc, newm.addr)
 		if err != nil {
-			log.Printf("ListenMulticastUDP %s: %v\n", newm, err)
+			if s.logLevel >= 1 {
+				log.Printf("ListenMulticastUDP %s: %v\n", newm, err)
+			}
 			continue
 		}
 		if err := SetMulticastTTL(conn, newm.ipver, 255); err != nil {
-			log.Printf("SetMulticastTTL %s: %v\n", newm, err)
+			if s.logLevel >= 1 {
+				log.Printf("SetMulticastTTL %s: %v\n", newm, err)
+			}
 		}
 		if err := SetMulticastLoopback(conn, newm.ipver, true); err != nil {
-			log.Printf("SetMulticastLoopback %s: %v\n", newm, err)
+			if s.logLevel >= 1 {
+				log.Printf("SetMulticastLoopback %s: %v\n", newm, err)
+			}
 		}
 		newm.conn = conn
 		s.mifcs[k] = newm
@@ -497,19 +515,25 @@ func (s *MDNS) SetOutgoingTTL(ttl uint32) {
 // A go routine to listen for packets on a network.  Pass to the main loop with sufficient information to
 // answer on the same interface.
 func (s *MDNS) udpListener(ifc *multicastIfc) {
-	log.Printf("MDNS listening on %s with %v", ifc, ifc.addresses)
+	if s.logLevel >= 1 {
+		log.Printf("MDNS listening on %s with %v", ifc, ifc.addresses)
+	}
 
 	b := make([]byte, 2048)
 	for ifc.run() && s.run() {
 		n, a, err := ifc.conn.ReadFromUDP(b)
 		if err != nil {
-			log.Printf("error reading from udp: %v", err)
+			if s.logLevel >= 1 {
+				log.Printf("error reading from udp: %v", err)
+			}
 		}
 
 		// convert to dns packet
 		msg := new(dns.Msg)
 		if !msg.Unpack(b[0:n]) {
-			log.Printf("couldn't unpack %d byte dns msg from %v", n, a)
+			if s.logLevel >= 1 {
+				log.Printf("couldn't unpack %d byte dns msg from %v", n, a)
+			}
 		} else {
 			s.fromNet <- &msgFromNet{ifc, a, msg}
 		}
@@ -701,11 +725,13 @@ func (s *MDNS) mainLoop() {
 		case m := <-s.fromNet:
 			if m.msg.Response {
 				// Cache the information.
-				if s.debug {
+				if s.logLevel >= 2 {
 					log.Printf("%s: response %v\n", s.hostName, m.msg)
 				}
 				if s.isDoppelGanger(m.msg.Answer) {
-					log.Printf("%s: name collision, %s also claims to be %s\n", s.hostName, m.sender, s.hostFQDN)
+					if s.logLevel >= 1 {
+						log.Printf("%s: name collision, %s also claims to be %s\n", s.hostName, m.sender, s.hostFQDN)
+					}
 					continue
 				}
 				for _, rr := range m.msg.Answer {
@@ -718,7 +744,7 @@ func (s *MDNS) mainLoop() {
 				if s.hostName == "" {
 					break
 				}
-				if s.debug {
+				if s.logLevel >= 2 {
 					log.Printf("%s: question %v\n", s.hostName, m.msg)
 				}
 				s.answerQuestionFromNet(m)
@@ -731,7 +757,9 @@ func (s *MDNS) mainLoop() {
 				s.services[req.service] = set
 			}
 			set[hostport(req.host, req.port)] = req
-			log.Printf("adding service %s %s %d\n", req.service, req.host, req.port)
+			if s.logLevel >= 1 {
+				log.Printf("adding service %s %s %d\n", req.service, req.host, req.port)
+			}
 
 			// Tell all the networks about the name
 			for _, mifc := range s.mifcs {
@@ -746,7 +774,9 @@ func (s *MDNS) mainLoop() {
 			if len(set) == 0 {
 				delete(s.services, req.service)
 			}
-			log.Printf("removing service %s %s %d\n", req.service, req.host, req.port)
+			if s.logLevel >= 1 {
+				log.Printf("removing service %s %s %d\n", req.service, req.host, req.port)
+			}
 
 			// Tell all the networks about the goodbye
 			for _, mifc := range s.mifcs {
@@ -1078,7 +1108,7 @@ func (s *MDNS) changedRR(rr dns.RR) {
 	default:
 		return
 	}
-	if s.debug {
+	if s.logLevel >= 2 {
 		log.Printf("%s: changed %v\n", s.hostName, rr)
 	}
 	s.watchedLock.RLock()

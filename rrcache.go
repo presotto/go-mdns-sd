@@ -22,14 +22,14 @@ type rrCache struct {
 	// The first key is the domain name and the second is the RR type
 	cache map[string]map[uint16][]*rrCacheEntry
 
-	debug bool
+	logLevel int
 }
 
 // Create a new rr cache.  Make sure at least the top level map exists.
-func newRRCache(debug bool) *rrCache {
+func newRRCache(logLevel int) *rrCache {
 	rrcache := new(rrCache)
 	rrcache.cache = make(map[string]map[uint16][]*rrCacheEntry, 0)
-	rrcache.debug = debug
+	rrcache.logLevel = logLevel
 	return rrcache
 }
 
@@ -50,7 +50,7 @@ func (c *rrCache) Add(rr dns.RR) bool {
 
 	// Remove all rr's matching this one's type if a cache flush is requested.
 	if rr.Header().Class&0x8000 == 0x8000 {
-		if c.debug {
+		if c.logLevel >= 2 {
 			log.Printf("cache flush for %v\n", rr)
 		}
 		dnmap[rr.Header().Rrtype] = make([]*rrCacheEntry, 0)
@@ -126,7 +126,7 @@ func (c *rrCache) Add(rr dns.RR) bool {
 			}
 		}
 		if same {
-			if c.debug {
+			if c.logLevel >= 2 {
 				log.Printf("replacing cached entry for %v with %v\n", rrslice[i].rr, rr)
 			}
 			rrslice[i] = entry
@@ -137,13 +137,13 @@ func (c *rrCache) Add(rr dns.RR) bool {
 	if firstnil >= 0 {
 		// Fill in a hole.
 		rrslice[firstnil] = entry
-		if c.debug {
+		if c.logLevel >= 2 {
 			log.Printf("adding cached entry for %v (in a hole)\n", rr)
 		}
 	} else {
 		// Append to the end of the list.
 		dnmap[rr.Header().Rrtype] = append(rrslice, entry)
-		if c.debug {
+		if c.logLevel >= 2 {
 			log.Printf("adding cached entry for %v (append)\n", rr)
 		}
 	}

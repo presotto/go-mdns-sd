@@ -81,7 +81,7 @@ func compare(a, b []dns.RR) bool {
 }
 
 func TestRRCache(t *testing.T) {
-	cache := newRRCache(*debugFlag)
+	cache := newRRCache(*logLevelFlag)
 	// Cache a number of RRs with short TTLs.
 	for _, rr := range short {
 		cache.Add(rr)
