@@ -16,7 +16,7 @@ import (
 
 var (
 	// common options
-	debugFlag = flag.Bool("debug", false, "turn on debugging")
+	logLevelFlag = flag.Int("v", 0, "log level")
 )
 
 type instance struct {
@@ -26,7 +26,7 @@ type instance struct {
 }
 
 func createInstance(service string, inst instance) *MDNS {
-	s, err := NewMDNS(inst.host, "224.0.0.254:9999", "[FF02::FF]:9998", true, *debugFlag)
+	s, err := NewMDNS(inst.host, "224.0.0.254:9999", "[FF02::FF]:9998", true, *logLevelFlag)
 	if err != nil {
 		log.Fatal("can't translate address: %v", err)
 	}
