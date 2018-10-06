@@ -28,7 +28,7 @@ type instance struct {
 func createInstance(service string, inst instance) *MDNS {
 	s, err := NewMDNS(inst.host, "224.0.0.254:9999", "[FF02::FF]:9998", true, *logLevelFlag)
 	if err != nil {
-		log.Fatal("can't translate address: %v", err)
+		log.Fatalf("can't translate address: %v", err)
 	}
 	s.AddService(service, inst.host, inst.port, inst.txt...)
 	return s
@@ -84,7 +84,7 @@ func checkDiscovered(host string, discovered []ServiceInstance, instances ...ins
 			return fmt.Errorf("%s didn't find SRV %s:%d", host, hostFQDN(inst.host), inst.port)
 		}
 		if !foundtxt[i] {
-			return fmt.Errorf("%s didn't find TXT %s:%d", host, inst.txt)
+			return fmt.Errorf("%s didn't find TXT %s:%d", host, inst.txt, inst.port)
 		}
 	}
 	return nil
