@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/presotto/go-mdns-sd/go_dns"
+	"github.com/vanadium/go-mdns-sd/go_dns"
 )
 
 var (

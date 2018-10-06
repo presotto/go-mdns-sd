@@ -36,7 +36,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/presotto/go-mdns-sd/go_dns"
+	"github.com/vanadium/go-mdns-sd/go_dns"
 )
 
 // All incoming network messages carries enough context for a network appropriate response.
@@ -480,12 +480,14 @@ func (s *MDNS) ScanInterfaces() (string, error) {
 			}
 			continue
 		}
-		if err := SetMulticastTTL(conn, newm.ipver, 255); err != nil {
+		conn, err = SetMulticastTTL(conn, newm.ipver, 255)
+		if err != nil {
 			if s.logLevel >= 1 {
 				log.Printf("SetMulticastTTL %s: %v\n", newm, err)
 			}
 		}
-		if err := SetMulticastLoopback(conn, newm.ipver, true); err != nil {
+		conn, err = SetMulticastLoopback(conn, newm.ipver, true)
+		if err != nil {
 			if s.logLevel >= 1 {
 				log.Printf("SetMulticastLoopback %s: %v\n", newm, err)
 			}
@@ -521,6 +523,7 @@ func (s *MDNS) udpListener(ifc *multicastIfc) {
 
 	b := make([]byte, 2048)
 	for ifc.run() && s.run() {
+		ifc.conn.SetDeadline(time.Now().Add(time.Second))
 		n, a, err := ifc.conn.ReadFromUDP(b)
 		if err != nil {
 			if s.logLevel >= 1 {
