@@ -24,7 +24,7 @@ func TestDNSTxt(t *testing.T) {
 		t.Error("unpacking txt rr failed")
 	}
 	if off != off_out {
-		t.Error("unpacked txt len got %d, expected %d", off_out, off)
+		t.Errorf("unpacked txt len got %v, expected %v", off_out, off)
 	}
 	x, ok := rr_out.(*RR_TXT)
 	if !ok {
